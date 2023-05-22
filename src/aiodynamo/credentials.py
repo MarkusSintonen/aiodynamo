@@ -8,12 +8,16 @@ import json
 import os
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from json import JSONDecodeError
 from pathlib import Path
+from time import time
 from typing import Callable, Optional, Sequence, TypeVar, cast
 
 from yarl import URL
 
+from .errors import BrokenThrottleConfig
 from .http.types import HttpImplementation, Request, RequestFailed
+from .models import ExponentialBackoffRetry, RetryConfig, RetryTimeout
 from .types import Timeout
 from .utils import logger, parse_amazon_timestamp
 
@@ -408,8 +412,191 @@ class InstanceMetadataCredentials(MetadataCredentials):
         )
 
 
+def sts_endpoint_default() -> URL:
+    use_regional_endpoint = os.environ.get("AWS_STS_REGIONAL_ENDPOINTS") == "regional"
+    if (
+        use_regional_endpoint
+        and (region := os.getenv("AWS_DEFAULT_REGION")) is not None
+    ):
+        return URL(f"https://sts.{region}.amazonaws.com")
+    else:
+        return URL("https://sts.amazonaws.com")
+
+
+# https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRoleWithWebIdentity.html
+# https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html
+@dataclass
+class AssumeRoleWithWebIdentityEnvironmentCredentials(MetadataCredentials):
+    STS_SCHEMA_VERSION = "2011-06-15"
+    # Retryable STS client errors
+    # https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRoleWithWebIdentity.html#API_AssumeRoleWithWebIdentity_Errors
+    STS_RETRYABLE_CLIENT_ERRORS = {"ExpiredToken", "IDPCommunicationError"}
+
+    retry_config: RetryConfig = field(
+        default_factory=lambda: ExponentialBackoffRetry(
+            base_delay_secs=1.5, time_limit_secs=6
+        )
+    )
+
+    web_identity_token_file: Optional[str] = field(
+        default_factory=lambda: os.getenv("AWS_WEB_IDENTITY_TOKEN_FILE")
+    )
+    role_arn: Optional[str] = field(default_factory=lambda: os.getenv("AWS_ROLE_ARN"))
+    role_session_name: str = field(
+        default_factory=lambda: os.getenv(
+            "AWS_ROLE_SESSION_NAME", f"aiodynamo-session-{int(time())}"
+        ),
+    )
+    sts_endpoint: URL = field(default_factory=sts_endpoint_default)
+
+    def __post_init__(self) -> None:
+        self.url_without_token = None
+
+        if self.web_identity_token_file is None:
+            return
+
+        if self.role_arn is None:
+            logger.error(
+                "The the current environment is configured to assume role with web identity but has no "
+                "role ARN configured. Ensure that the AWS_ROLE_ARN env var is set."
+            )
+            return
+
+        self.url_without_token = self.sts_endpoint.with_query(
+            {
+                "Action": "AssumeRoleWithWebIdentity",
+                "RoleArn": self.role_arn,
+                "RoleSessionName": self.role_session_name,
+                "Version": self.STS_SCHEMA_VERSION,
+            }
+        )
+        super().__post_init__()
+
+    @property
+    def token(self) -> Optional[str]:
+        if self.web_identity_token_file is None:
+            return None
+        else:
+            try:
+                with open(self.web_identity_token_file) as token_file:
+                    return token_file.read()
+            except IOError as e:
+                raise AssumeRoleWebIdentityException(
+                    "Failed to read web identity token file"
+                ) from e
+
+    @property
+    def url(self) -> Optional[URL]:
+        if self.url_without_token is not None and (token := self.token):
+            return self.url_without_token.update_query({"WebIdentityToken": token})
+        return None
+
+    def is_disabled(self) -> bool:
+        return self.url is None
+
+    async def fetch_metadata(self, http: HttpImplementation) -> Metadata:
+        if url := self.url:
+            return await self.request_sts_credentials(url, http)
+        raise Disabled()
+
+    async def request_sts_credentials(
+        self, url: URL, http: HttpImplementation
+    ) -> Metadata:
+        # Retry handling same as in aiodynamo Client.send_request
+        exception: Optional[Exception] = None
+        try:
+            async for _ in self.retry_config.attempts():
+                try:
+                    request = Request(
+                        method="POST",
+                        url=str(url),
+                        headers={"Accept": "application/json"},
+                        body=None,
+                    )
+                    response = await http(request)
+                    if 200 <= response.status <= 299:
+                        return self.parse_credentials(response.body)
+
+                    exception = AssumeRoleWebIdentityHTTPStatusException(
+                        status=response.status, body=response.body
+                    )
+                    if response.status >= 500 or response.status == 429:
+                        continue  # Retryable error codes
+                    sts_api_exc = self.sts_api_exception(response.status, response.body)
+                    if sts_api_exc is None:
+                        continue  # Retry unknown api errors
+                    exception = sts_api_exc
+                    if sts_api_exc.sts_code in self.STS_RETRYABLE_CLIENT_ERRORS:
+                        continue
+                    raise sts_api_exc
+                except asyncio.TimeoutError as exc:
+                    exception = exc
+                    continue
+                except RequestFailed as exc:
+                    exception = exc.inner
+                    continue
+        except RetryTimeout as retry_exc:
+            cause = exception or retry_exc
+            raise TooManyRetries("Too many retries to STS") from cause
+        raise BrokenThrottleConfig()
+
+    def sts_api_exception(
+        self, status_code: int, raw_body: bytes
+    ) -> Optional[AssumeRoleWebIdentityClientException]:
+        try:
+            error_json = json.loads(raw_body)
+        except JSONDecodeError:
+            return None
+
+        if isinstance(error_json, dict) and (sts_error := error_json.get("Error")):
+            return AssumeRoleWebIdentityClientException(
+                sts_code=sts_error["Code"],
+                sts_message=sts_error["Message"],
+                status=status_code,
+                body=raw_body,
+            )
+        return None
+
+    def parse_credentials(self, raw_body: bytes) -> Metadata:
+        resp = json.loads(raw_body)["AssumeRoleWithWebIdentityResponse"]
+        credentials = resp["AssumeRoleWithWebIdentityResult"]["Credentials"]
+        return Metadata(
+            key=Key(
+                id=credentials["AccessKeyId"],
+                secret=credentials["SecretAccessKey"],
+                token=credentials["SessionToken"],
+            ),
+            expires=datetime.datetime.fromtimestamp(
+                float(credentials["Expiration"]),  # In unix seconds
+                tz=datetime.timezone.utc,
+            ),
+        )
+
+
 class TooManyRetries(Exception):
     pass
+
+
+class AssumeRoleWebIdentityException(Exception):
+    pass
+
+
+class AssumeRoleWebIdentityHTTPStatusException(AssumeRoleWebIdentityException):
+    def __init__(self, *, status: int, body: bytes, message: Optional[str] = None):
+        super().__init__(
+            message
+            or f"STS AssumeRoleByWebIdentity request failed. status: {status}, body: {repr(body)}"
+        )
+        self.status = status
+        self.body = body
+
+
+class AssumeRoleWebIdentityClientException(AssumeRoleWebIdentityHTTPStatusException):
+    def __init__(self, *, status: int, body: bytes, sts_code: str, sts_message: str):
+        exc_msg = f"STS AssumeRoleByWebIdentity request failed. sts_code: {sts_code}, sts_message: {sts_message}"
+        super().__init__(status=status, body=body, message=exc_msg)
+        self.sts_code = sts_code
+        self.sts_message = sts_code
 
 
 async def fetch_with_retry_and_timeout(

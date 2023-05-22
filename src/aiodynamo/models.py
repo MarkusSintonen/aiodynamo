@@ -225,12 +225,18 @@ class RetryConfig(MyPyWorkaroundRetryConfigBase, metaclass=abc.ABCMeta):
         raise NotImplementedError()
 
     async def attempts(self) -> AsyncIterable[None]:
-        deadline = time.monotonic() + self.time_limit_secs
+        deadline = self._time_monotonic() + self.time_limit_secs
         for delay in self.delays():
             yield
-            if time.monotonic() > deadline:
+            if self._time_monotonic() > deadline:
                 raise RetryTimeout()
-            await asyncio.sleep(delay)
+            await self._sleep(delay)
+
+    def _time_monotonic(self) -> float:
+        return time.monotonic()
+
+    async def _sleep(self, delay: float) -> None:
+        await asyncio.sleep(delay)
 
 
 @dataclass(frozen=True)
